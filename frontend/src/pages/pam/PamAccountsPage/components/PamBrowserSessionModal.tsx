@@ -19,6 +19,7 @@ type Props = {
 export const PamBrowserSessionModal = ({ isOpen, onOpenChange, session }: Props) => {
   const [query, setQuery] = useState("");
   const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
 
   // Health check
   const { data: health } = useCheckSessionHealth(session?.sessionId || "", {
@@ -36,11 +37,17 @@ export const PamBrowserSessionModal = ({ isOpen, onOpenChange, session }: Props)
       return;
     }
 
+    // Clear previous results and errors
+    setError(null);
+    setResult(null);
+
     try {
       const queryResult = await executeQuery({ sessionId: session.sessionId, query: query.trim() });
       setResult(queryResult);
-    } catch {
-      // Silently fail - errors will be shown in the UI if needed
+    } catch (err: any) {
+      const errorMessage =
+        err?.response?.data?.message || err?.message || "Failed to execute query";
+      setError(errorMessage);
     }
   };
 
@@ -50,6 +57,15 @@ export const PamBrowserSessionModal = ({ isOpen, onOpenChange, session }: Props)
       onOpenChange(false);
     }
   }, [health, onOpenChange]);
+
+  // Clear state when modal closes or session changes
+  useEffect(() => {
+    if (!isOpen || !session) {
+      setQuery("");
+      setResult(null);
+      setError(null);
+    }
+  }, [isOpen, session]);
 
   // Terminate session when modal closes
   const handleClose = async () => {
@@ -98,6 +114,19 @@ export const PamBrowserSessionModal = ({ isOpen, onOpenChange, session }: Props)
               Execute Query
             </Button>
           </div>
+
+          {/* Error Display */}
+          {error && (
+            <div className="rounded-md border border-red-500/50 bg-red-900/20 p-3">
+              <div className="flex items-start gap-2">
+                <span className="text-red-400">⚠</span>
+                <div className="flex-1">
+                  <div className="text-sm font-medium text-red-300">Query Error</div>
+                  <div className="mt-1 text-sm text-red-200">{error}</div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Results */}
           {result && (

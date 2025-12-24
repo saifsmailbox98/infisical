@@ -34,7 +34,7 @@ export const PamQueryResultsTable = ({ rows, fields, rowCount }: Props) => {
           <Tr>
             {fields && fields.length > 0
               ? fields.map((field, i) => (
-                  <Th key={`col-${i}`} className="text-xs" title={`Type ID: ${field.dataTypeID}`}>
+                  <Th key={`col-${i}`} className="text-xs">
                     {field.name}
                   </Th>
                 ))

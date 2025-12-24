@@ -115,7 +115,7 @@ export const registerPamAccountSessionRouter = async (server: FastifyZodProvider
     handler: async (req) => {
       const { sessionId } = req.params;
 
-      const health = await server.services.pamAccountSessionManager.checkHealth(sessionId);
+      const health = await server.services.pamAccountSessionManager.checkHealth(sessionId, req.permission);
 
       return health;
     }
@@ -162,10 +162,10 @@ export const registerPamAccountSessionRouter = async (server: FastifyZodProvider
       const { query } = req.body;
 
       // Execute query first - will throw NotFoundError/GoneError if session doesn't exist
-      const result = await server.services.pamAccountSessionManager.executeQuery(sessionId, query);
+      const result = await server.services.pamAccountSessionManager.executeQuery(sessionId, query, req.permission);
 
       // Get session info for audit logging (we know it exists now)
-      const sessionInfo = server.services.pamAccountSessionManager.getSessionInfo(sessionId);
+      const sessionInfo = server.services.pamAccountSessionManager.getSessionInfo(sessionId, req.permission);
 
       await server.services.auditLog.createAuditLog({
         ...req.auditLogInfo,
@@ -174,7 +174,10 @@ export const registerPamAccountSessionRouter = async (server: FastifyZodProvider
           type: EventType.PAM_SESSION_LOGS_UPDATE,
           metadata: {
             sessionId,
-            accountName: sessionInfo!.accountName
+            accountName: sessionInfo!.accountName,
+            query: query.substring(0, 1000), // Truncate long queries for audit log
+            rowCount: String(result.rowCount),
+            executionTimeMs: String(result.executionTimeMs)
           }
         }
       });
@@ -205,12 +208,12 @@ export const registerPamAccountSessionRouter = async (server: FastifyZodProvider
     handler: async (req) => {
       const { sessionId } = req.params;
 
-      const sessionInfo = server.services.pamAccountSessionManager.getSessionInfo(sessionId);
+      const sessionInfo = server.services.pamAccountSessionManager.getSessionInfo(sessionId, req.permission);
       if (!sessionInfo) {
         throw new BadRequestError({ message: "Session not found" });
       }
 
-      await server.services.pamAccountSessionManager.terminateSession(sessionId);
+      await server.services.pamAccountSessionManager.terminateSession(sessionId, req.permission);
 
       await server.services.auditLog.createAuditLog({
         ...req.auditLogInfo,

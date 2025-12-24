@@ -13,6 +13,8 @@ import { TPamAccountServiceFactory } from "./pam-account-service";
 type TActiveSession = {
   sessionId: string;
   pamSessionId: string;
+  userId: string; // User who created the session
+  orgId: string; // Organization for additional security
   relayConnection: TLSSocket;
   gatewayConnection: TLSSocket;
   relayHost: string;
@@ -79,6 +81,9 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
   // In-memory storage for active sessions
   const activeSessions = new Map<string, TActiveSession>();
 
+  // Cleanup interval ID for graceful shutdown
+  let cleanupIntervalId: NodeJS.Timeout | null = null;
+
   // Helper: Format error message
   const formatError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -125,7 +130,13 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
       };
 
       dataHandler = (chunk: Buffer) => {
-        parser.parse(chunk, (msg: any) => messageHandler(msg, resolve, reject, cleanup));
+        try {
+          validateMessageBuffer(chunk);
+          parser.parse(chunk, (msg: any) => messageHandler(msg, resolve, reject, cleanup));
+        } catch (err) {
+          cleanup();
+          reject(err);
+        }
       };
 
       timeout = setTimeout(() => {
@@ -182,6 +193,80 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
       conn.destroy();
     } catch {
       // Ignore errors
+    }
+  };
+
+  // Helper: Validate protocol message buffer
+  const validateMessageBuffer = (chunk: Buffer): void => {
+    // Prevent DoS attacks with overly large messages (max 10MB)
+    const MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
+    if (chunk.length > MAX_MESSAGE_SIZE) {
+      throw new BadRequestError({ message: "Message size exceeds maximum allowed limit" });
+    }
+
+    // PostgreSQL messages have minimum 5 bytes (type + length)
+    if (chunk.length < 5) {
+      // This is fine - parser will buffer incomplete messages
+      return;
+    }
+
+    // Validate message length field (bytes 1-4 in network byte order)
+    const messageLength = chunk.readUInt32BE(1);
+    if (messageLength > MAX_MESSAGE_SIZE) {
+      throw new BadRequestError({ message: "Message length field exceeds maximum allowed limit" });
+    }
+
+    // Length field should not be negative or unreasonably small
+    if (messageLength < 4) {
+      throw new BadRequestError({ message: "Invalid message length field" });
+    }
+  };
+
+  // Helper: Verify session ownership
+  const verifySessionOwnership = (session: TActiveSession, actor: OrgServiceActor): void => {
+    // For service tokens, check org match
+    if (actor.type === "service") {
+      if (session.orgId !== actor.orgId) {
+        throw new NotFoundError({ message: "Session not found" }); // Don't reveal it exists
+      }
+      return;
+    }
+
+    // For users, check both user and org match
+    if (actor.type === "user") {
+      if (session.userId !== actor.id || session.orgId !== actor.orgId) {
+        throw new NotFoundError({ message: "Session not found" }); // Don't reveal it exists
+      }
+      return;
+    }
+
+    // For other actor types, deny access
+    throw new NotFoundError({ message: "Session not found" });
+  };
+
+  // Helper: Validate SQL query for basic safety
+  const validateQuery = (query: string): void => {
+    const trimmed = query.trim();
+
+    // Check for empty query
+    if (!trimmed) {
+      throw new BadRequestError({ message: "Query cannot be empty" });
+    }
+
+    // Check for multiple statements (prevents SQL injection via stacked queries)
+    // Allow semicolons inside strings but reject multiple top-level statements
+    const statementsOutsideStrings = trimmed
+      .replace(/'[^']*'/g, "") // Remove single-quoted strings
+      .replace(/"[^"]*"/g, ""); // Remove double-quoted strings
+
+    const semicolonCount = (statementsOutsideStrings.match(/;/g) || []).length;
+    if (semicolonCount > 1 || (semicolonCount === 1 && !statementsOutsideStrings.trim().endsWith(";"))) {
+      throw new BadRequestError({ message: "Multiple SQL statements are not allowed" });
+    }
+
+    // Check query length (prevent DoS)
+    if (trimmed.length > 100000) {
+      throw new BadRequestError({ message: "Query is too long (max 100KB)" });
     }
   };
 
@@ -307,11 +392,16 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
   };
 
   // Terminate session
-  const terminateSession = async (sessionId: string): Promise<void> => {
+  const terminateSession = async (sessionId: string, actor?: OrgServiceActor): Promise<void> => {
     const session = activeSessions.get(sessionId);
 
     if (!session) {
       throw new NotFoundError({ message: "Session not found" });
+    }
+
+    // Verify ownership if actor provided (external call)
+    if (actor) {
+      verifySessionOwnership(session, actor);
     }
 
     try {
@@ -407,6 +497,8 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
       const session: TActiveSession = {
         sessionId: accessResponse.sessionId,
         pamSessionId: accessResponse.sessionId,
+        userId: actor.type === "user" ? actor.id : "",
+        orgId: actor.orgId,
         relayConnection,
         gatewayConnection,
         relayHost: accessResponse.relayHost,
@@ -455,11 +547,22 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
   };
 
   // Get session info
-  const getSessionInfo = (sessionId: string): { accountId: string; accountName: string } | null => {
+  const getSessionInfo = (
+    sessionId: string,
+    actor: OrgServiceActor
+  ): { accountId: string; accountName: string } | null => {
     const session = activeSessions.get(sessionId);
     if (!session) {
       return null;
     }
+
+    // Verify ownership
+    try {
+      verifySessionOwnership(session, actor);
+    } catch {
+      return null; // Don't reveal session exists
+    }
+
     return {
       accountId: session.account.id,
       accountName: session.account.name
@@ -467,11 +570,18 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
   };
 
   // Check if session is alive
-  const checkHealth = async (sessionId: string): Promise<THealthCheckResult> => {
+  const checkHealth = async (sessionId: string, actor: OrgServiceActor): Promise<THealthCheckResult> => {
     const session = activeSessions.get(sessionId);
 
     if (!session) {
       return { isAlive: false, error: "Session not found" };
+    }
+
+    // Verify ownership
+    try {
+      verifySessionOwnership(session, actor);
+    } catch {
+      return { isAlive: false, error: "Session not found" }; // Don't reveal it exists
     }
 
     if (new Date() > session.expiresAt) {
@@ -493,12 +603,18 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
   };
 
   // Execute query on existing session
-  const executeQuery = async (sessionId: string, query: string): Promise<TQueryResult> => {
+  const executeQuery = async (sessionId: string, query: string, actor: OrgServiceActor): Promise<TQueryResult> => {
     const session = activeSessions.get(sessionId);
 
     if (!session) {
       throw new NotFoundError({ message: "Session not found" });
     }
+
+    // Verify ownership
+    verifySessionOwnership(session, actor);
+
+    // Validate query for safety
+    validateQuery(query);
 
     if (new Date() > session.expiresAt) {
       await terminateSession(sessionId);
@@ -532,7 +648,7 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
 
   // Background cleanup job for expired sessions
   const startCleanupInterval = () => {
-    setInterval(() => {
+    cleanupIntervalId = setInterval(() => {
       const now = new Date();
       for (const [sessionId, session] of activeSessions.entries()) {
         if (now > session.expiresAt) {
@@ -544,6 +660,14 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
     }, 60000); // Run every 60 seconds
   };
 
+  // Stop cleanup interval for graceful shutdown
+  const stopCleanup = () => {
+    if (cleanupIntervalId) {
+      clearInterval(cleanupIntervalId);
+      cleanupIntervalId = null;
+    }
+  };
+
   // Start cleanup on service initialization
   startCleanupInterval();
 
@@ -552,6 +676,7 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
     getSessionInfo,
     checkHealth,
     executeQuery,
-    terminateSession
+    terminateSession,
+    stopCleanup
   };
 };

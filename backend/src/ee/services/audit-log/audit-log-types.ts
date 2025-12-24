@@ -4120,6 +4120,9 @@ interface PamSessionLogsUpdateEvent {
   metadata: {
     sessionId: string;
     accountName: string;
+    query?: string;
+    rowCount?: string;
+    executionTimeMs?: string;
   };
 }
 
