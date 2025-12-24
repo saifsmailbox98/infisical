@@ -93,16 +93,30 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
   // Helper: Format error message
   const formatError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-  // Helper: Cleanup event listeners and timeout
-  const cleanupListeners = (
-    connection: TLSSocket,
-    timeout: NodeJS.Timeout,
-    dataHandler: (chunk: Buffer) => void,
-    errorHandler: (err: Error) => void
-  ) => {
-    clearTimeout(timeout);
-    connection.removeListener("data", dataHandler);
-    connection.removeListener("error", errorHandler);
+  // Helper: Validate protocol message buffer
+  const validateMessageBuffer = (chunk: Buffer): void => {
+    // Prevent DoS attacks with overly large messages (max 10MB)
+    const MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
+    if (chunk.length > MAX_MESSAGE_SIZE) {
+      throw new BadRequestError({ message: "Message size exceeds maximum allowed limit" });
+    }
+
+    // PostgreSQL messages have minimum 5 bytes (type + length)
+    if (chunk.length < 5) {
+      // This is fine - parser will buffer incomplete messages
+      return;
+    }
+
+    // Validate message length field (bytes 1-4 in network byte order)
+    const messageLength = chunk.readUInt32BE(1);
+    if (messageLength > MAX_MESSAGE_SIZE) {
+      throw new BadRequestError({ message: "Message length field exceeds maximum allowed limit" });
+    }
+
+    // Length field should not be negative or unreasonably small
+    if (messageLength < 4) {
+      throw new BadRequestError({ message: "Invalid message length field" });
+    }
   };
 
   // Helper: Execute PostgreSQL protocol operation with timeout
@@ -110,9 +124,9 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
     gatewayConn: TLSSocket,
     operation: (parser: Parser) => void,
     messageHandler: (
-      msg: any,
+      msg: unknown,
       resolve: (value: T) => void,
-      reject: (reason?: any) => void,
+      reject: (reason?: unknown) => void,
       cleanup: () => void
     ) => void,
     timeoutMs: number,
@@ -138,7 +152,7 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
       dataHandler = (chunk: Buffer) => {
         try {
           validateMessageBuffer(chunk);
-          parser.parse(chunk, (msg: any) => messageHandler(msg, resolve, reject, cleanup));
+          parser.parse(chunk, (msg: unknown) => messageHandler(msg, resolve, reject, cleanup));
         } catch (err) {
           cleanup();
           reject(err);
@@ -199,32 +213,6 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
       conn.destroy();
     } catch {
       // Ignore errors
-    }
-  };
-
-  // Helper: Validate protocol message buffer
-  const validateMessageBuffer = (chunk: Buffer): void => {
-    // Prevent DoS attacks with overly large messages (max 10MB)
-    const MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
-    if (chunk.length > MAX_MESSAGE_SIZE) {
-      throw new BadRequestError({ message: "Message size exceeds maximum allowed limit" });
-    }
-
-    // PostgreSQL messages have minimum 5 bytes (type + length)
-    if (chunk.length < 5) {
-      // This is fine - parser will buffer incomplete messages
-      return;
-    }
-
-    // Validate message length field (bytes 1-4 in network byte order)
-    const messageLength = chunk.readUInt32BE(1);
-    if (messageLength > MAX_MESSAGE_SIZE) {
-      throw new BadRequestError({ message: "Message length field exceeds maximum allowed limit" });
-    }
-
-    // Length field should not be negative or unreasonably small
-    if (messageLength < 4) {
-      throw new BadRequestError({ message: "Invalid message length field" });
     }
   };
 
@@ -339,11 +327,18 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
         });
         gatewayConn.write(startupMessage);
       },
-      (msg, resolve, reject, cleanup) => {
-        if (msg.name === "readyForQuery") {
+      (msg: unknown, resolve, reject, cleanup) => {
+        // Type guard for message objects
+        if (typeof msg !== "object" || msg === null || !("name" in msg)) {
+          return;
+        }
+
+        const message = msg as { name: string };
+
+        if (message.name === "readyForQuery") {
           cleanup();
           resolve();
-        } else if (msg.name === "error") {
+        } else if (message.name === "error") {
           cleanup();
           reject(new Error("PostgreSQL startup error"));
         }
@@ -367,26 +362,39 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
         const queryMessage = serialize.query(query);
         gatewayConn.write(queryMessage);
       },
-      (msg: any, resolve, reject, cleanup) => {
-        if (msg.name === "rowDescription") {
+      (msg: unknown, resolve, reject, cleanup) => {
+        // Type guard for message objects
+        if (typeof msg !== "object" || msg === null || !("name" in msg)) {
+          return;
+        }
+
+        const message = msg as { name: string; fields?: unknown[] };
+
+        if (message.name === "rowDescription") {
           // Extract full field metadata including data types
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          fields.push(
-            ...msg.fields.map((f: any) => ({
-              name: f.name,
-              dataTypeID: f.dataTypeID,
-              dataTypeSize: f.dataTypeSize,
-              dataTypeModifier: f.dataTypeModifier,
-              tableID: f.tableID,
-              columnID: f.columnID
-            }))
-          );
-        } else if (msg.name === "dataRow") {
-          results.push(msg.fields);
-        } else if (msg.name === "readyForQuery") {
+          if (Array.isArray(message.fields)) {
+            fields.push(
+              ...message.fields.map((f: unknown) => {
+                const field = f as Record<string, unknown>;
+                return {
+                  name: String(field.name ?? ""),
+                  dataTypeID: Number(field.dataTypeID ?? 0),
+                  dataTypeSize: Number(field.dataTypeSize ?? 0),
+                  dataTypeModifier: Number(field.dataTypeModifier ?? 0),
+                  tableID: field.tableID !== undefined ? Number(field.tableID) : undefined,
+                  columnID: field.columnID !== undefined ? Number(field.columnID) : undefined
+                };
+              })
+            );
+          }
+        } else if (message.name === "dataRow") {
+          if (Array.isArray(message.fields)) {
+            results.push(message.fields as TPostgresValue[]);
+          }
+        } else if (message.name === "readyForQuery") {
           cleanup();
           resolve();
-        } else if (msg.name === "error") {
+        } else if (message.name === "error") {
           cleanup();
           reject(new Error("PostgreSQL query error"));
         }
