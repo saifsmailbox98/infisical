@@ -67,7 +67,13 @@ export const registerPamAccountSessionRouter = async (server: FastifyZodProvider
         {
           accountPath,
           projectId,
-          duration
+          duration,
+          actorMetadata: {
+            actorEmail: req.auth.user.email ?? "",
+            actorIp: req.realIp,
+            actorName: `${req.auth.user.firstName ?? ""} ${req.auth.user.lastName ?? ""}`.trim(),
+            actorUserAgent: req.auditLogInfo.userAgent ?? ""
+          }
         },
         req.permission
       );

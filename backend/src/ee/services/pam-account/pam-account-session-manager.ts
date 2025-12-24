@@ -44,6 +44,12 @@ type TCreateSessionDTO = {
   accountPath: string;
   projectId: string;
   duration?: string;
+  actorMetadata: {
+    actorEmail: string;
+    actorIp: string;
+    actorName: string;
+    actorUserAgent: string;
+  };
 };
 
 // PostgreSQL field value types (returned as strings in text mode, or typed in binary mode)
@@ -307,6 +313,7 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
         socket: relayConn,
         ...certsToBuffers(certs),
         ALPNProtocols: [alpn],
+        // TODO: Verify if hardcoded "localhost" is correct for SNI. Should this be the gateway hostname or configurable?
         servername: "localhost",
         minVersion: "TLSv1.2" as const,
         maxVersion: "TLSv1.3" as const,
@@ -434,7 +441,7 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
 
   // Create a new session
   const createSession = async (
-    { accountPath, projectId, duration = "4h" }: TCreateSessionDTO,
+    { accountPath, projectId, duration = "4h", actorMetadata }: TCreateSessionDTO,
     actor: OrgServiceActor
   ) => {
     // Parse duration
@@ -450,10 +457,10 @@ export const pamAccountSessionManagerFactory = ({ pamAccountService }: TPamAccou
       {
         accountPath,
         projectId,
-        actorEmail: "",
-        actorIp: "",
-        actorName: "",
-        actorUserAgent: "",
+        actorEmail: actorMetadata.actorEmail,
+        actorIp: actorMetadata.actorIp,
+        actorName: actorMetadata.actorName,
+        actorUserAgent: actorMetadata.actorUserAgent,
         duration: durationMs
       },
       actor
